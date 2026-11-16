@@ -3,9 +3,16 @@
 PageRank over real-world graphs in C with POSIX threads.
 Assignment 1 for HY-342 (Parallel Programming), University of Crete.
 
-The program reads an edge list, builds an adjacency-list graph and runs 50 PageRank iterations
-(damping factor 0.85), splitting the work between threads. The ranks are written to
-`pagerank.csv`.
+The program reads an edge list and stores the graph by incoming edges (CSR). It then runs 50
+iterations of
+
+```
+PR(v) = (1 - d) + d * Σ PR(u) / outdegree(u)    over all u → v,   d = 0.85
+```
+
+The nodes are split evenly between the threads. In every iteration each thread updates its own
+nodes, reading the previous iteration's ranks. The threads then meet at a barrier before the next
+iteration starts. The ranks are written to `pagerank.csv`.
 
 ## Files
 
@@ -23,11 +30,19 @@ The datasets come from the [Stanford SNAP collection](https://snap.stanford.edu/
 
 ```bash
 gcc -O2 -pthread main.c -o pagerank
-./pagerank
+./pagerank [edge_list_file] [threads]
+
+./pagerank Email-Enron.txt 4
+./pagerank p2p-Gnutella24.txt 2
+./pagerank facebook/0.edges 4
 ```
 
-The input file (`Email-Enron.txt`) and the number of threads (`NUM_THREADS`, default 2) are set
-at the top of `main.c`.
+Defaults: `Email-Enron.txt` and 2 threads. The program prints the run time of the PageRank
+iterations.
+
+## Note
+
+The timings in the report were measured with an earlier version of the code.
 
 ## Output
 

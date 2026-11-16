@@ -1,193 +1,283 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h> 
- 
-#define N 367667
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+
 #define DAMPING_FACTOR 0.85
 #define INITIAL_RANK 1.0
 #define MAX_ITERATIONS 50
-#define NUM_THREADS 2
+#define DEFAULT_THREADS 2
 
-
-pthread_t threads[NUM_THREADS]; 
-pthread_mutex_t mutex;
-pthread_barrier_t barrier;
-
-struct Graph
-{
-    struct Node* head[N];
-    int numNodes;
-    int from;
-    int to;
+/*
+ * Graph in compressed (CSR) form, stored by *incoming* edges:
+ * the nodes that link to node v are in_edges[in_start[v] .. in_start[v + 1] - 1].
+ */
+struct Graph {
+    long numNodes;
+    long numEdges;
+    long* in_start;
+    long* in_edges;
+    long* out_degree;
 };
- 
-struct Node
-{
-    long dest;
-    double pagerank;
-    struct Node* next;
-};
- 
+
 struct Edge {
     long src, dest;
 };
 
-struct Graph* createGraph(struct Edge edges[], int n)
-{
-    struct Graph* graph = (struct Graph*)malloc(sizeof(struct Graph));
- 
-    for (int i = 0; i < N; i++) {
-        graph->head[i] = NULL;
-        graph->from = 0;
-        graph->to = 0;
-        graph->numNodes = 0;
-    }
- 
-    for (int i = 0; i < n; i++)
-    {
+/*
+ * Simple reusable barrier (pthread_barrier_t is not available on macOS).
+ */
+struct Barrier {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int count;
+    int waiting;
+    unsigned long generation;
+};
 
-        long src = edges[i].src;
-        long dest = edges[i].dest;
- 
-        struct Node* newNode = (struct Node*)malloc(sizeof(struct Node));
-        graph->numNodes++;
-        newNode->dest = dest;
-        newNode->pagerank = 1.0;
-        newNode->next = graph->head[src]; 
-
-        graph->head[src] = newNode;
-    }
- 
-    return graph;
+static void barrier_init(struct Barrier* b, int count) {
+    pthread_mutex_init(&b->mutex, NULL);
+    pthread_cond_init(&b->cond, NULL);
+    b->count = count;
+    b->waiting = 0;
+    b->generation = 0;
 }
- 
-void printGraph(struct Graph* graph)
-{
-    for (int i = 0; i < N; i++)
-    {
-        struct Node* ptr = graph->head[i];
-        while (ptr != NULL)
-        {
-            printf("(%d —> %ld)\t", i, ptr->dest);
-            ptr = ptr->next;
+
+static void barrier_wait(struct Barrier* b) {
+    pthread_mutex_lock(&b->mutex);
+    unsigned long gen = b->generation;
+    if (++b->waiting == b->count) {
+        b->waiting = 0;
+        b->generation++;
+        pthread_cond_broadcast(&b->cond);
+    } else {
+        while (gen == b->generation) {
+            pthread_cond_wait(&b->cond, &b->mutex);
         }
- 
-        printf("\n");
     }
+    pthread_mutex_unlock(&b->mutex);
 }
 
-void *PageRank(void* arg){
-    double* pageRank = (double*)malloc(N * sizeof(double));
-    struct Graph* graph = (struct Graph*) arg;
-    int n = graph->numNodes;
+static void barrier_destroy(struct Barrier* b) {
+    pthread_mutex_destroy(&b->mutex);
+    pthread_cond_destroy(&b->cond);
+}
 
-    if(pageRank == NULL){
-        printf("Error: Memory allocation failed\n");
+/* Data shared by all threads */
+struct Shared {
+    struct Graph* graph;
+    double* rank[2];          /* rank[iter % 2] is read, rank[(iter + 1) % 2] is written */
+    struct Barrier barrier;
+};
+
+/* Each thread computes the ranks of the nodes in [from, to) */
+struct ThreadArgs {
+    struct Shared* shared;
+    long from;
+    long to;
+};
+
+/*
+ * Read the edge list ("src dest" per line, lines starting with '#' are comments).
+ */
+struct Edge* read_edges(const char* filename, long* numEdges, long* numNodes) {
+    FILE* file = fopen(filename, "r");
+    if (file == NULL) {
         return NULL;
     }
 
-    for(int i = 0; i < n; i++){
-        pageRank[i] = INITIAL_RANK;
-    }
+    long capacity = 1024;
+    long count = 0;
+    long maxNode = -1;
+    struct Edge* edges = malloc(capacity * sizeof(struct Edge));
+    char line[256];
 
-    pthread_mutex_lock(&mutex);
-    for(int iter = graph->from; iter < graph->to; iter++){
-        double* newPageRank = (double*)malloc(N * sizeof(double));
-        if(newPageRank == NULL){
-            printf("Error: Memory allocation failed\n");
-            return NULL;
+    while (edges != NULL && fgets(line, sizeof(line), file) != NULL) {
+        long src, dest;
+        if (line[0] == '#' || sscanf(line, "%ld %ld", &src, &dest) != 2 || src < 0 || dest < 0) {
+            continue;
         }
-
-        for(int i = 0; i < n; i++){
-            double sum = 0;
-
-            struct Node* current = graph->head[i];
-            while(current != NULL){
-                long j = current->dest;
-
-                int out_degree = 0;
-                struct Node* out = graph->head[j];
-
-                while(out != NULL){
-                    out_degree++;
-                    sum += out->pagerank;
-                    out = out->next;
-                }
-
-                current = current->next;
+        if (count == capacity) {
+            capacity *= 2;
+            struct Edge* bigger = realloc(edges, capacity * sizeof(struct Edge));
+            if (bigger == NULL) {
+                free(edges);
+                edges = NULL;
+                break;
             }
-
-            newPageRank[i] = (1 - DAMPING_FACTOR) + DAMPING_FACTOR * sum;
+            edges = bigger;
         }
-
-        pageRank = newPageRank;
-        free(newPageRank);
+        edges[count].src = src;
+        edges[count].dest = dest;
+        count++;
+        if (src > maxNode) maxNode = src;
+        if (dest > maxNode) maxNode = dest;
     }
-    pthread_mutex_unlock(&mutex);
 
-    return (void*) pageRank;
+    fclose(file);
+    *numEdges = count;
+    *numNodes = maxNode + 1;
+    return edges;
 }
 
+struct Graph* createGraph(struct Edge edges[], long numEdges, long numNodes) {
+    struct Graph* graph = malloc(sizeof(struct Graph));
+    if (graph == NULL) {
+        return NULL;
+    }
+    graph->numNodes = numNodes;
+    graph->numEdges = numEdges;
+    graph->in_start = calloc(numNodes + 1, sizeof(long));
+    graph->in_edges = malloc((numEdges > 0 ? numEdges : 1) * sizeof(long));
+    graph->out_degree = calloc(numNodes > 0 ? numNodes : 1, sizeof(long));
+    long* next = malloc((numNodes > 0 ? numNodes : 1) * sizeof(long));
+    if (!graph->in_start || !graph->in_edges || !graph->out_degree || !next) {
+        free(next);
+        return NULL;
+    }
 
-int main(){
-    double* pagerank;
-    int numEdges = 0;
-    int capacity = 100;
-    char *line = malloc(100 * sizeof(char));
-    FILE *file = fopen("Email-Enron.txt", "r");
-    if(file == NULL){
-        printf("Error: File not found\n");
+    /* Count incoming edges per node and outgoing edges per node */
+    for (long i = 0; i < numEdges; i++) {
+        graph->in_start[edges[i].dest + 1]++;
+        graph->out_degree[edges[i].src]++;
+    }
+    for (long v = 0; v < numNodes; v++) {
+        graph->in_start[v + 1] += graph->in_start[v];
+        next[v] = graph->in_start[v];
+    }
+    for (long i = 0; i < numEdges; i++) {
+        graph->in_edges[next[edges[i].dest]++] = edges[i].src;
+    }
+
+    free(next);
+    return graph;
+}
+
+void freeGraph(struct Graph* graph) {
+    if (graph == NULL) return;
+    free(graph->in_start);
+    free(graph->in_edges);
+    free(graph->out_degree);
+    free(graph);
+}
+
+/*
+ * PR(v) = (1 - d) + d * sum(PR(u) / outdegree(u)) over all u that link to v.
+ * All threads do every iteration, each for its own range of nodes,
+ * and wait at the barrier before the next iteration starts.
+ */
+void* PageRank(void* arg) {
+    struct ThreadArgs* args = (struct ThreadArgs*)arg;
+    struct Shared* shared = args->shared;
+    struct Graph* graph = shared->graph;
+
+    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+        const double* oldRank = shared->rank[iter % 2];
+        double* newRank = shared->rank[(iter + 1) % 2];
+
+        for (long v = args->from; v < args->to; v++) {
+            double sum = 0;
+            for (long k = graph->in_start[v]; k < graph->in_start[v + 1]; k++) {
+                long u = graph->in_edges[k];
+                sum += oldRank[u] / graph->out_degree[u];
+            }
+            newRank[v] = (1 - DAMPING_FACTOR) + DAMPING_FACTOR * sum;
+        }
+
+        barrier_wait(&shared->barrier);
+    }
+
+    return NULL;
+}
+
+int main(int argc, char* argv[]) {
+    const char* filename = argc > 1 ? argv[1] : "Email-Enron.txt";
+    int numThreads = argc > 2 ? atoi(argv[2]) : DEFAULT_THREADS;
+    const char* outputName = "pagerank.csv";
+
+    if (argc > 3 || numThreads < 1) {
+        printf("Usage: %s [edge_list_file] [threads]\n", argv[0]);
         return 1;
     }
-    
-    struct Edge* edges = (struct Edge*)malloc(700000 * sizeof(struct Edge)); 
-    if(edges == NULL){
+
+    long numEdges, numNodes;
+    struct Edge* edges = read_edges(filename, &numEdges, &numNodes);
+    if (edges == NULL) {
+        printf("Error: Could not read %s\n", filename);
+        return 1;
+    }
+
+    struct Graph* graph = createGraph(edges, numEdges, numNodes);
+    free(edges);
+    if (graph == NULL) {
         printf("Error: Memory allocation failed\n");
         return 1;
     }
 
-    pthread_mutex_init(&mutex, NULL);
-    pthread_barrier_init(&barrier, NULL, NUM_THREADS);
+    struct Shared shared;
+    shared.graph = graph;
+    shared.rank[0] = malloc((numNodes > 0 ? numNodes : 1) * sizeof(double));
+    shared.rank[1] = malloc((numNodes > 0 ? numNodes : 1) * sizeof(double));
+    if (shared.rank[0] == NULL || shared.rank[1] == NULL) {
+        printf("Error: Memory allocation failed\n");
+        return 1;
+    }
+    for (long v = 0; v < numNodes; v++) {
+        shared.rank[0][v] = INITIAL_RANK;
+    }
+    if (numThreads > numNodes && numNodes > 0) {
+        numThreads = (int)numNodes;
+    }
+    barrier_init(&shared.barrier, numThreads);
 
-    while (fgets(line, sizeof(line), file) != NULL) {
-        if (line[0] == '#'){
-            continue;
-        }
-
-        if  (sscanf(line, "%ld %ld", &edges[numEdges].src, &edges[numEdges].dest) == 2){
-            numEdges++;
-        }
+    pthread_t* threads = malloc(numThreads * sizeof(pthread_t));
+    struct ThreadArgs* args = malloc(numThreads * sizeof(struct ThreadArgs));
+    if (threads == NULL || args == NULL) {
+        printf("Error: Memory allocation failed\n");
+        return 1;
     }
 
-    struct Graph* graph = createGraph(edges, numEdges);
-    int iterationsPerThread = MAX_ITERATIONS / NUM_THREADS; 
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
 
-    for (int i = 0; i < NUM_THREADS; i++) {
-        graph->from = i * iterationsPerThread;
-        graph->to = (i == NUM_THREADS - 1) ? MAX_ITERATIONS : (i + 1) * iterationsPerThread; 
-        pthread_create(&threads[i], NULL, &PageRank, (void*)graph);
+    /* Split the nodes evenly between the threads */
+    long chunk = numNodes / numThreads;
+    for (int i = 0; i < numThreads; i++) {
+        args[i].shared = &shared;
+        args[i].from = i * chunk;
+        args[i].to = (i == numThreads - 1) ? numNodes : (i + 1) * chunk;
+        pthread_create(&threads[i], NULL, PageRank, &args[i]);
+    }
+    for (int i = 0; i < numThreads; i++) {
+        pthread_join(threads[i], NULL);
     }
 
-    for(int i = 0; i < NUM_THREADS; i++){
-        pthread_join(threads[i], (void**)&pagerank);
-    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("%s: %ld nodes, %ld edges, %d threads, %d iterations: %.3f s\n",
+           filename, numNodes, numEdges, numThreads, MAX_ITERATIONS, elapsed);
 
-    FILE* output_file = fopen("pagerank.csv", "w");
+    /* The final ranks are in the buffer written by the last iteration */
+    const double* pagerank = shared.rank[MAX_ITERATIONS % 2];
+
+    FILE* output_file = fopen(outputName, "w");
     if (output_file == NULL) {
         fprintf(stderr, "Error opening output file\n");
-        exit(1);
+        return 1;
     }
     fprintf(output_file, "node,pagerank\n");
-    for (int i = 0; i < graph->numNodes; i++) {
-        fprintf(output_file, "%d,%f\n", i, pagerank[i]);
+    for (long v = 0; v < numNodes; v++) {
+        fprintf(output_file, "%ld,%f\n", v, pagerank[v]);
     }
     fclose(output_file);
 
-    pthread_mutex_destroy(&mutex);
-    pthread_barrier_destroy(&barrier);
-    free(line);
-    free(edges);
-    fclose(file);
+    barrier_destroy(&shared.barrier);
+    free(shared.rank[0]);
+    free(shared.rank[1]);
+    free(threads);
+    free(args);
+    freeGraph(graph);
 
     return 0;
 }
