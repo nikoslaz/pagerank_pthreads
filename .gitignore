@@ -1,0 +1,7 @@
+# Build outputs
+pagerank
+a.out
+*.o
+
+# Program output
+pagerank.csv
